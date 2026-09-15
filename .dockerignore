@@ -11,3 +11,7 @@ venv/
 .env
 .env.*
 *.md
+# Embedded SQLite ingestion store (incl. WAL sidecars)
+*.db
+*.db-wal
+*.db-shm

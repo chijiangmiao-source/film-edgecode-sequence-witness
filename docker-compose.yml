@@ -5,6 +5,12 @@ services:
     ports:
       # Host port is overridable: API_PORT=9000 docker compose up api
       - "${API_PORT:-8000}:8000"
+    environment:
+      # Ingestion tasks/chunks live in embedded SQLite; the named volume
+      # keeps them across container restarts and recreations.
+      EDGECODE_DB_PATH: /data/edgecode_ingest.db
+    volumes:
+      - edgecode-data:/data
     healthcheck:
       test:
         - CMD
@@ -27,3 +33,6 @@ services:
     # One-shot acceptance: unit/integration tests, then live HTTP checks.
     command: ["sh", "-c", "python -m pytest tests -q && python scripts/acceptance.py"]
     restart: "no"
+
+volumes:
+  edgecode-data:

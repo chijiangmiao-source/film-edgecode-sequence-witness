@@ -3,45 +3,48 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from app.assembly import assemble, validate_assembly
 from app.errors import register_exception_handlers
+from app.ingest import IngestionService
 from app.models import (
     AmbiguousResponse,
     AssembleRequest,
     AssembleResponse,
-    ConnectivityEvidence,
-    DegreeEvidence,
-    FirstDifference,
+    ChunkAck,
+    ChunkSubmitRequest,
     ImpossibleResponse,
-    StartEvidence,
+    TaskCreateRequest,
+    TaskState,
     UniqueResponse,
     VerifyInvalidResponse,
     VerifyRequest,
     VerifyResponse,
     VerifyValidResponse,
-    Witnesses,
+    render_assembly_result,
 )
 from app.validation import validate_fragments, validate_start
 
-_EVIDENCE_MODELS = {
-    "degree": DegreeEvidence,
-    "start": StartEvidence,
-    "connectivity": ConnectivityEvidence,
-}
+# A chunk submission either stores a new chunk (201, ChunkAck), replays an
+# identical re-send (200, ChunkAck), or -- when it declares completion --
+# returns the same body a one-shot /assemble would have produced (200).
+ChunkResponse = ChunkAck | UniqueResponse | AmbiguousResponse | ImpossibleResponse
 
 
-def create_app() -> FastAPI:
+def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(
         title="Film Edge-Code Assembly API",
-        version="1.0.0",
+        version="1.1.0",
         summary=(
             "Assemble a multiset of overlapping film edge-code fragments into "
             "the complete edge-code string, or prove that the reel order is "
-            "ambiguous / impossible."
+            "ambiguous / impossible.  Bulk imports can use the resumable "
+            "chunked ingestion flow backed by embedded SQLite."
         ),
     )
     register_exception_handlers(app)
+    ingestion = IngestionService(db_path)
 
     @app.get("/health", tags=["meta"])
     def health() -> dict[str, str]:
@@ -56,29 +59,8 @@ def create_app() -> FastAPI:
     def assemble_endpoint(request: AssembleRequest) -> AssembleResponse:
         validate_start(request.k, request.start)
         validate_fragments(request.k, request.fragments)
-        result = assemble(request.k, request.start, request.fragments)
-        if result.status == "unique":
-            assert result.assembly is not None
-            return UniqueResponse(
-                assembly=result.assembly,
-                length=len(result.assembly),
-                fragment_count=result.fragment_count,
-            )
-        if result.status == "ambiguous":
-            assert result.min_witness is not None and result.max_witness is not None
-            lo, hi = result.min_witness, result.max_witness
-            index = next(
-                i for i, (a, b) in enumerate(zip(lo, hi)) if a != b
-            )
-            return AmbiguousResponse(
-                witnesses=Witnesses(min=lo, max=hi),
-                first_difference=FirstDifference(index=index, min=lo[index], max=hi[index]),
-                fragment_count=result.fragment_count,
-            )
-        assert result.evidence is not None and result.reason is not None
-        return ImpossibleResponse(
-            reason=result.reason,  # type: ignore[arg-type]
-            evidence=_EVIDENCE_MODELS[result.reason](**result.evidence),
+        return render_assembly_result(
+            assemble(request.k, request.start, request.fragments)
         )
 
     @app.post(
@@ -101,6 +83,52 @@ def create_app() -> FastAPI:
         return VerifyInvalidResponse(
             reason=outcome["reason"], detail=outcome["detail"]
         )
+
+    @app.post(
+        "/tasks",
+        response_model=TaskState,
+        status_code=201,
+        tags=["ingestion"],
+        summary="Create a resumable ingestion task",
+    )
+    def create_task_endpoint(request: TaskCreateRequest) -> TaskState:
+        validate_start(request.k, request.start)
+        return ingestion.create_task(
+            k=request.k, start=request.start, expected_total=request.expected_total
+        )
+
+    @app.get(
+        "/tasks/{task_id}",
+        response_model=TaskState,
+        tags=["ingestion"],
+        summary="Inspect an ingestion task (resume after restart)",
+    )
+    def get_task_endpoint(task_id: str) -> TaskState:
+        return ingestion.get_task(task_id)
+
+    @app.post(
+        "/tasks/{task_id}/chunks",
+        tags=["ingestion"],
+        summary="Submit one zero-based chunk; the final chunk may declare completion",
+        responses={
+            200: {
+                "model": ChunkResponse,
+                "description": "Replayed acknowledgement for an identical "
+                "re-send, or the assembly result when completion is declared.",
+            },
+            201: {"model": ChunkAck, "description": "Chunk stored."},
+        },
+    )
+    def submit_chunk_endpoint(
+        task_id: str, request: ChunkSubmitRequest
+    ) -> JSONResponse:
+        outcome = ingestion.submit_chunk(
+            task_id,
+            index=request.index,
+            fragments=request.fragments,
+            complete=request.complete,
+        )
+        return JSONResponse(status_code=outcome.status_code, content=outcome.body)
 
     return app
 

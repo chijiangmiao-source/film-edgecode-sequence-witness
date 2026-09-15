@@ -1,12 +1,16 @@
 """One-shot acceptance run against a live API (compose service ``verify``).
 
 Exercises the running container over HTTP: health, unique / ambiguous /
-impossible outcomes, witness re-computation, structured errors, and a
-20 000-fragment stress case.  Exits non-zero if any check fails.
+impossible outcomes, witness re-computation, structured errors, a
+20 000-fragment stress case, and the resumable chunked ingestion flow
+(out-of-order backfill, concurrent duplicate chunks, conflicting re-sends,
+and resume/replay of completed responses).  Exits non-zero if any check
+fails.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import random
 import sys
@@ -222,6 +226,141 @@ def main() -> int:
                     json={"k": 12, "start": start, "fragments": fragments, "candidate": witness},
                 ).json()
                 check("20k witness recomputes as valid", rv.get("valid") is True)
+
+        # ==================================================================
+        # resumable chunked ingestion
+        #
+        # Process-restart durability itself is covered by pytest
+        # (tests/test_ingest.py::test_restart_resume_and_replay, which runs
+        # in this compose verify step); over plain HTTP the client-visible
+        # half is resuming from server state and replaying the completed
+        # response, checked below.
+        # ==================================================================
+
+        one_shot = client.post(
+            "/assemble",
+            json={"k": 3, "start": "AB", "fragments": ["ABC", "ABC", "BCA", "CAB"]},
+        ).json()
+
+        # --- path 1: out-of-order backfill --------------------------------
+        r = client.post("/tasks", json={"k": 3, "start": "AB", "expected_total": 4})
+        task = r.json()
+        task_id = task.get("task_id", "")
+        check(
+            "ingest: task created (k, start, expected total)",
+            r.status_code == 201
+            and task.get("status") == "open"
+            and task.get("received_total") == 0
+            and task.get("expected_total") == 4
+            and bool(task_id),
+            repr(task),
+        )
+        r1 = client.post(f"/tasks/{task_id}/chunks", json={"index": 1, "fragments": ["BCA", "CAB"]})
+        r0 = client.post(
+            f"/tasks/{task_id}/chunks",
+            json={"index": 0, "fragments": ["ABC", "ABC"], "complete": True},
+        )
+        check(
+            "ingest: out-of-order chunks, final chunk completes with the one-shot result",
+            r1.status_code == 201 and r0.status_code == 200 and r0.json() == one_shot,
+            f"chunk1={r1.status_code} final={r0.status_code} body={r0.text[:200]}",
+        )
+        replay = client.post(
+            f"/tasks/{task_id}/chunks",
+            json={"index": 0, "fragments": ["ABC", "ABC"], "complete": True},
+        )
+        check(
+            "ingest: completed response replays identically",
+            replay.status_code == 200 and replay.json() == r0.json(),
+            replay.text[:200],
+        )
+        state = client.get(f"/tasks/{task_id}").json()
+        check(
+            "ingest: completed task state carries the stored result",
+            state.get("status") == "completed" and state.get("result") == r0.json(),
+            repr(state)[:300],
+        )
+        late = client.post(f"/tasks/{task_id}/chunks", json={"index": 2, "fragments": ["ABC"]})
+        check(
+            "ingest: write after completion -> 409 TASK_COMPLETED",
+            late.status_code == 409 and late.json()["error"]["code"] == "TASK_COMPLETED",
+            late.text[:200],
+        )
+
+        # --- path 2: concurrent identical chunk written once ---------------
+        tid = client.post("/tasks", json={"k": 3, "start": "AB", "expected_total": 2}).json()["task_id"]
+
+        def send_chunk(_: int) -> httpx.Response:
+            return client.post(
+                f"/tasks/{tid}/chunks", json={"index": 0, "fragments": ["ABC", "ABC"]}
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            responses = list(pool.map(send_chunk, range(8)))
+        codes = [r.status_code for r in responses]
+        state = client.get(f"/tasks/{tid}").json()
+        check(
+            "ingest: concurrent identical chunk written exactly once",
+            codes.count(201) == 1
+            and codes.count(200) == 7
+            and len({r.text for r in responses}) == 1
+            and state.get("received_total") == 2
+            and state.get("chunk_count") == 1,
+            f"codes={sorted(codes)} state={state}",
+        )
+
+        # --- path 3: conflicting re-send -----------------------------------
+        identical = client.post(f"/tasks/{tid}/chunks", json={"index": 0, "fragments": ["ABC", "ABC"]})
+        conflict = client.post(f"/tasks/{tid}/chunks", json={"index": 0, "fragments": ["ABD", "ABD"]})
+        details = conflict.json().get("error", {}).get("details", {})
+        check(
+            "ingest: identical retry replays ack, different content -> 409 CHUNK_CONFLICT",
+            identical.status_code == 200
+            and conflict.status_code == 409
+            and conflict.json()["error"]["code"] == "CHUNK_CONFLICT"
+            and details.get("task_id") == tid
+            and details.get("index") == 0,
+            conflict.text[:300],
+        )
+
+        # --- path 4: gap blocks completion, backfill resumes and completes --
+        tid = client.post("/tasks", json={"k": 3, "start": "AB", "expected_total": 4}).json()["task_id"]
+        client.post(f"/tasks/{tid}/chunks", json={"index": 0, "fragments": ["ABC", "ABC"]})
+        gap = client.post(
+            f"/tasks/{tid}/chunks", json={"index": 2, "fragments": ["CAB"], "complete": True}
+        )
+        check(
+            "ingest: completion with a gap -> 409 MISSING_CHUNKS (locatable)",
+            gap.status_code == 409
+            and gap.json()["error"]["code"] == "MISSING_CHUNKS"
+            and gap.json()["error"]["details"].get("missing_indices") == [1]
+            and gap.json()["error"]["details"].get("task_id") == tid,
+            gap.text[:300],
+        )
+        client.post(f"/tasks/{tid}/chunks", json={"index": 1, "fragments": ["BCA"]})
+        done = client.post(
+            f"/tasks/{tid}/chunks", json={"index": 2, "fragments": ["CAB"], "complete": True}
+        )
+        check(
+            "ingest: backfilled task completes with the one-shot result",
+            done.status_code == 200 and done.json() == one_shot,
+            done.text[:200],
+        )
+        overflow = client.post(
+            "/tasks", json={"k": 3, "start": "AB", "expected_total": 1}
+        ).json()["task_id"]
+        over = client.post(f"/tasks/{overflow}/chunks", json={"index": 0, "fragments": ["ABC", "ABC"]})
+        check(
+            "ingest: chunk beyond expected total -> 409 CHUNK_OVERFLOW",
+            over.status_code == 409 and over.json()["error"]["code"] == "CHUNK_OVERFLOW",
+            over.text[:200],
+        )
+        missing = client.get("/tasks/definitely-not-a-task")
+        check(
+            "ingest: unknown task -> 404 TASK_NOT_FOUND",
+            missing.status_code == 404 and missing.json()["error"]["code"] == "TASK_NOT_FOUND",
+            missing.text[:200],
+        )
 
     print()
     if failures:
