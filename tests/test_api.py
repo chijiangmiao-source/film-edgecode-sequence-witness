@@ -212,6 +212,27 @@ def test_k_wrong_type():
     )
 
 
+@pytest.mark.parametrize("k", ["3", "12", 3.0, 3.5, True, False, None, [3]])
+def test_k_must_be_a_json_integer(k):
+    # Numeric strings, floats and booleans are type errors, never coerced.
+    error = assert_envelope(
+        assemble({"k": k, "start": "AB", "fragments": ["ABC"]}),
+        422,
+        "VALIDATION_ERROR",
+    )
+    k_errors = [d for d in error["details"] if "k" in d["loc"]]
+    assert k_errors and k_errors[0]["type"] in {"int_type", "int_from_float"}
+
+
+def test_start_wrong_type():
+    error = assert_envelope(
+        assemble({"k": 3, "start": 12, "fragments": ["ABC"]}),
+        422,
+        "VALIDATION_ERROR",
+    )
+    assert any("start" in detail["loc"] for detail in error["details"])
+
+
 def test_start_wrong_length():
     error = assert_envelope(
         assemble({"k": 3, "start": "ABC", "fragments": ["ABC"]}),

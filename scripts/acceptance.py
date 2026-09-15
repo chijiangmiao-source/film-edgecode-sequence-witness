@@ -155,6 +155,17 @@ def main() -> int:
             r.status_code == 422 and r.json()["error"]["code"] == "VALIDATION_ERROR",
             repr(r.json()),
         )
+        r = client.post("/assemble", json={"k": "3", "start": "AB", "fragments": ["ABC"]})
+        check(
+            "k as string -> 422 type error (no coercion)",
+            r.status_code == 422
+            and r.json()["error"]["code"] == "VALIDATION_ERROR"
+            and any(
+                "k" in d["loc"] and d["type"] == "int_type"
+                for d in r.json()["error"]["details"]
+            ),
+            repr(r.json()),
+        )
         r = client.post("/assemble", json={"k": 3, "start": "AB", "fragments": ["abC"]})
         check(
             "lowercase fragment -> INVALID_FRAGMENTS",

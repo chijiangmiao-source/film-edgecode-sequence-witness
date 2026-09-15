@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 MAX_FRAGMENTS = 20_000
 MIN_K = 3
@@ -17,10 +17,11 @@ MAX_CANDIDATE_LENGTH = (MAX_K - 1) + MAX_FRAGMENTS
 class AssembleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    k: int = Field(
+    k: StrictInt = Field(
         ge=MIN_K,
         le=MAX_K,
-        description="fragment length; every fragment has exactly k characters",
+        description="fragment length; every fragment has exactly k characters "
+        "(must be a JSON integer, not a numeric string)",
     )
     start: str = Field(
         description="designated start prefix: exactly k-1 characters of A-Z / 0-9"
